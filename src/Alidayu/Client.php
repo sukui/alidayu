@@ -3,6 +3,8 @@ namespace Flc\Alidayu;
 
 use Exception;
 use Flc\Alidayu\Requests\IRequest;
+use ZanPHP\Config\Config;
+use ZanPHP\HttpClient\HttpClient;
 
 /**
  * 阿里大于客户端
@@ -11,7 +13,7 @@ use Flc\Alidayu\Requests\IRequest;
  * @link   http://flc.ren
  */
 class Client
-{   
+{
     /**
      * API请求地址
      * @var string
@@ -46,19 +48,66 @@ class Client
      * 静态配置
      * @var array
      */
-    protected static $config = [];
+    protected static $app_key;
+    protected static $app_secret;
+    protected static $sandbox=false;
+
+    /**
+     * @var static
+     */
+    private static $_instance = null;
+
+    /**
+     * @param array $config
+     * @return static
+     */
+    final public static function instance($config=[])
+    {
+        return static::singleton($config);
+    }
+
+    final public static function singleton($config=[])
+    {
+        if (null === static::$_instance) {
+            static::$_instance = new static($config);
+        }
+        return static::$_instance;
+    }
+
+    /**
+     * @param $config
+     * @return static
+     */
+    final public static function getInstance($config=[])
+    {
+        return static::singleton($config);
+    }
+
+    final public static function swap($instance)
+    {
+        static::$_instance = $instance;
+    }
 
     /**
      * 初始化
      * @param array $config 阿里大于配置App类
+     * @throws Exception
      */
-    public function __construct(App $app)
+    public function __construct($config=[])
     {
-        $this->app = $app;
+
+        if(empty($config)){
+            $config = Config::get('sms');
+        }
 
         // 判断配置
-        if (empty($this->app->app_key) || empty($this->app->app_secret)) {
+        if (empty($config['app_key']) || empty($config['app_secret'])) {
             throw new Exception("阿里大于配置信息：app_key或app_secret错误");
+        }
+        self::$app_key = $config['app_key'];
+        self::$app_secret = $config['app_secret'];
+        if(isset($config['sandbox'])){
+            self::$sandbox = $config['sandbox'];
         }
     }
 
@@ -81,22 +130,27 @@ class Client
             $serviceParams
         );
 
+        var_dump($params);
+
         // 签名
         $params['sign'] = $this->generateSign($params);
 
         // 请求数据
-        $resp = $this->curl(
-            $this->app->sandbox ? $this->api_sandbox_uri : $this->api_uri,
+        $resp =yield $this->curl(
+            self::$sandbox ? $this->api_sandbox_uri : $this->api_uri,
             $params
         );
 
+        var_dump($resp);
+
         // 解析返回
-        return $this->parseRep($resp);
+        yield $this->parseRep($resp);
     }
 
     /**
      * 设置签名方式
      * @param string $value 签名方式，支持md5, hmac
+     * @return $this
      */
     public function setSignMethod($value = 'md5')
     {
@@ -108,6 +162,7 @@ class Client
     /**
      * 设置回传格式
      * @param string $value 响应格式，支持json/xml
+     * @return $this
      */
     public function setFormat($value = 'json')
     {
@@ -118,27 +173,37 @@ class Client
 
     /**
      * 解析返回数据
+     * @param $response
      * @return array|false
+     * @throws Exception
      */
     protected function parseRep($response)
     {
         if ($this->format == 'json') {
-            $resp = json_decode($response);
-
-            if (false !== $resp) {
-                $resp = @current($resp);
-            }
+            $resp = json_decode($response,true);
         }
-
         elseif ($this->format == 'xml') {
-            $resp = @simplexml_load_string($response);
+            $resp = Support::xml2arr($response);
         }
 
         else {
             throw new Exception("format错误...");
         }
+        if(empty($resp['error_response'])){
+            return true;
+        }else{
+            $errorMsg = $resp['error_response']['msg'];
 
-        return $resp;
+            if(!empty($resp['error_response']['sub_code'])){
+                $errorMsg .= '-'.$resp['error_response']['sub_code'];
+            }
+
+            if(!empty($resp['error_response']['sub_msg'])){
+                $errorMsg .= '-'.$resp['error_response']['sub_msg'];
+            }
+
+            throw new Exception($errorMsg,$resp['error_response']['code']);
+        }
     }
 
     /**
@@ -148,7 +213,7 @@ class Client
     protected function getPublicParams()
     {
         return [
-            'app_key'     => $this->app->app_key,
+            'app_key'     => self::$app_key,
             'timestamp'   => date('Y-m-d H:i:s'),
             'format'      => $this->format,
             'v'           => '2.0',
@@ -158,8 +223,9 @@ class Client
 
     /**
      * 生成签名
-     * @param  array  $params 待签参数
-     * @return string         
+     * @param  array $params 待签参数
+     * @return string
+     * @throws Exception
      */
     protected function generateSign($params = [])
     {
@@ -186,7 +252,7 @@ class Client
             $arr[] = $k . $v;
         }
         
-        $str = $this->app->app_secret . implode('', $arr) . $this->app->app_secret;
+        $str = self::$app_secret . implode('', $arr) . self::$app_secret;
 
         return strtoupper(md5($str));
     }
@@ -207,7 +273,7 @@ class Client
         
         $str = implode('', $arr);
 
-        return strtoupper(hash_hmac('md5', $str, $this->app->app_secret));
+        return strtoupper(hash_hmac('md5', $str, self::$app_secret));
     }
 
     /**
@@ -220,50 +286,6 @@ class Client
         ksort($params);
     }
 
-    /**
-     * 请求API
-     * @param  string   $method   接口名称
-     * @param  callable $callable 执行函数
-     * @return [type]             [description]
-     */
-    public static function request($method, callable $callable)
-    {
-        // A. 校验
-        if (empty($method) ||
-            ! $classname = self::getMethodClassName($method)
-        ) {
-            throw new Exception("method错误");
-        }
-
-        // B. 获取带命名空间的类
-        $classNameSpace = __NAMESPACE__ . '\\Requests\\' . $classname;
-
-        if (! class_exists($classNameSpace)) 
-            throw new Exception("method不存在");
-
-        // C. 创建对象
-        $request = new $classNameSpace;
-
-        // D. 执行匿名函数
-        if (is_callable($callable)) {
-            call_user_func($callable, $request);
-        }
-
-        // E. 创建CLIENT对象
-        $client = new self(new App(self::$config));
-
-        return call_user_func_array([$client, 'execute'], [$request]);
-    }
-
-    /**
-     * 静态配置（全局）
-     * @param  array $config 配置项
-     * @return [type]         [description]
-     */
-    public static function configure($config)
-    {
-        self::$config = $config;
-    }
 
     /**
      * 通过接口名称获取对应的类名称
@@ -290,33 +312,14 @@ class Client
 
     /**
      * curl请求
-     * @param  string $url        string
+     * @param  string $url string
      * @param  array|null $postFields 请求参数
-     * @return [type]             [description]
+     * @return \Generator [type]             [description]
      */
     protected function curl($url, $postFields = null)
     {
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_FAILONERROR, false);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        //https 请求
-        if(strlen($url) > 5 && strtolower(substr($url,0,5)) == "https" ) {
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        }
-        if (is_array($postFields) && 0 < count($postFields)) {
-            $postBodyString = "";
-            foreach ($postFields as $k => $v) {
-                $postBodyString .= "$k=" . urlencode($v) . "&"; 
-            }
-            unset($k, $v);
-            curl_setopt($ch, CURLOPT_POST, true);
-            $header = array("content-type: application/x-www-form-urlencoded; charset=UTF-8");
-            curl_setopt($ch,CURLOPT_HTTPHEADER,$header);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, substr($postBodyString,0,-1));
-        }
-        $reponse = curl_exec($ch);
-        return $reponse;
+        $httpClient = new HttpClient();
+        $response = yield $httpClient->postByURL($url,$postFields);
+        yield (intval($response->getStatusCode()) === 200) ? $response->getBody() : false;
     }
 }
